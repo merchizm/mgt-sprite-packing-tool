@@ -1,0 +1,10 @@
+IMAGE_FILTER = "Image Files (*.png *.jpg *.jpeg *.webp *.bmp)"
+MIPMAP_FILTERS = ["lanczos4", "kaiser", "mitchell", "catmullrom", "box"]
+KTX2_MODES = ["UASTC", "ETC1S"]
+JSON_FORMATS = ["hash", "array"]
+PACKING_ALGORITHMS = ["Grid", "Basic", "MaxRects", "Polygon"]
+PIXEL_FORMATS = ["RGBA8888", "RGB888", "RGB565", "RGBA4444"]
+APP_NAME = "Meric's Game Tools - Sprite Packing Tool"
+APP_VERSION = "0.2.0"
+REPOSITORY_URL = "https://github.com/merchizm/mgt-sprite-packing-tool"
+KTX_RELEASES_URL = "https://github.com/KhronosGroup/KTX-Software/releases"
