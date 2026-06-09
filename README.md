@@ -2,6 +2,10 @@
 
 Desktop sprite atlas utility for building PixiJS-compatible PNG/JSON atlases, splitting existing sprite sheets, previewing regions, and exporting optional KTX2 textures.
 
+![screenshot 1](assets/screenshot_1.png)
+![screenshot 2](assets/screenshot_2.png)
+
+
 Repository: https://github.com/merchizm/mgt-sprite-packing-tool
 
 ## Features
