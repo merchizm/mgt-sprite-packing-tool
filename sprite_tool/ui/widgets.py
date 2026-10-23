@@ -130,6 +130,14 @@ class SpriteListWidget(QListWidget):
         self.setAcceptDrops(True)
         self.setDragDropMode(QListWidget.InternalMove)
 
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        if self.count() == 0:
+            painter = QPainter(self.viewport())
+            painter.setPen(QColor("#6f8498"))
+            painter.drawText(self.viewport().rect(), Qt.AlignCenter | Qt.TextWordWrap, "Drop images here\nor click Add Files")
+            painter.end()
+
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -385,6 +393,7 @@ class PreviewPanel(QWidget):
 
         sidebar = QWidget()
         sidebar.setObjectName("previewSidebar")
+        sidebar.setMinimumWidth(240)
         sidebar_layout = QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
         sidebar_layout.setSpacing(10)

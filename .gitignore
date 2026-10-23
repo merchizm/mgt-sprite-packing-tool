@@ -1,3 +1,6 @@
 .venv
 .idea
 __pycache__
+/sprite_tool/__pycache__
+/sprite_tool/services/__pycache__
+/sprite_tool/ui/__pycache__

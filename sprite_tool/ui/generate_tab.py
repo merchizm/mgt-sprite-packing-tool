@@ -1,11 +1,14 @@
 import json
 import os
 import random
+import re
+import shutil
+from html import escape
 from typing import List, Optional
 
 from PIL import Image
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QColor
+from PyQt5.QtCore import Qt, QTimer, QUrl
+from PyQt5.QtGui import QColor, QDesktopServices
 from PyQt5.QtWidgets import (
     QAction,
     QCheckBox,
@@ -14,6 +17,7 @@ from PyQt5.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDockWidget,
+    QFrame,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -26,7 +30,9 @@ from PyQt5.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
+    QTabWidget,
     QTextEdit,
     QToolBar,
     QToolButton,
@@ -47,108 +53,185 @@ from sprite_tool.services.optimization import (
     optimize_png,
 )
 from sprite_tool.services.pixi import build_pixi_data
-from sprite_tool.ui.widgets import FileDropLineEdit, PreviewPanel, SpriteListWidget, build_browse_field, build_help_field, build_help_label, pil_to_qpixmap
+from sprite_tool.ui.widgets import FileDropLineEdit, PreviewPanel, SpriteListWidget, build_browse_field, pil_to_qpixmap
 
 ITEM_KIND_ROLE = Qt.UserRole
 ITEM_PATH_ROLE = Qt.UserRole + 1
 ITEM_COLOR_ROLE = Qt.UserRole + 2
 DEFAULT_SPACER_COLOR = (45, 57, 71, 255)
+PACKING_HINTS = {
+    "Grid": "Every sprite gets an equal cell, in list order. Simple and predictable.",
+    "Basic": "Sprites fill rows from left to right. Compact when sizes are similar.",
+    "MaxRects": "Fits sprites of different sizes tightly for the smallest atlas.",
+    "Polygon": "Placed like MaxRects, plus outline points per sprite in the JSON.",
+}
 
 
 class GenerateExportDialog(QDialog):
-    def __init__(self, parent: QWidget, image_path: str, json_path: str, ktx2_path: str, ktx2_enabled: bool) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Atlas Export")
-        self.output_image_edit = QLineEdit(image_path)
-        self.output_json_edit = QLineEdit(json_path)
-        self.output_ktx2_edit = QLineEdit(ktx2_path)
-        self.ktx2_checkbox = QCheckBox("Export KTX2")
-        self.ktx2_checkbox.setChecked(ktx2_enabled)
+    """Export summary: pick a folder and name, review every file that will be written."""
 
-        image_browse = QPushButton("Browse")
-        image_browse.clicked.connect(lambda: self._select_file(self.output_image_edit, "PNG (*.png)"))
-        json_browse = QPushButton("Browse")
-        json_browse.clicked.connect(lambda: self._select_file(self.output_json_edit, "JSON (*.json)"))
-        ktx2_browse = QPushButton("Browse")
-        ktx2_browse.clicked.connect(lambda: self._select_file(self.output_ktx2_edit, "KTX2 (*.ktx2)"))
+    def __init__(self, parent: QWidget, folder: str, name: str, plan, tab) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Export Atlas")
+        self.setMinimumWidth(640)
+        self._plan = plan
+
+        self.folder_edit = QLineEdit(folder)
+        self.folder_edit.setPlaceholderText("Where should the files be saved?")
+        self.name_edit = QLineEdit(name)
+        self.name_edit.setPlaceholderText("e.g. characters")
+        browse_button = QPushButton("Choose Folder...")
+        browse_button.clicked.connect(self._select_folder)
+
+        title = QLabel("Save your atlas")
+        title.setObjectName("dialogTitle")
+        intro = QLabel("Pick a folder and a name, then tick only the files you want. Your choices are remembered.")
+        intro.setObjectName("hint")
+        intro.setWordWrap(True)
+
+        folder_row = QWidget()
+        folder_layout = QHBoxLayout(folder_row)
+        folder_layout.setContentsMargins(0, 0, 0, 0)
+        folder_layout.addWidget(self.folder_edit, 1)
+        folder_layout.addWidget(browse_button)
 
         form = QFormLayout()
-        form.addRow("Sheet PNG", self._row(self.output_image_edit, image_browse))
-        form.addRow("PixiJS JSON", self._row(self.output_json_edit, json_browse))
-        form.addRow("", self.ktx2_checkbox)
-        form.addRow("KTX2", self._row(self.output_ktx2_edit, ktx2_browse))
+        form.setSpacing(10)
+        form.addRow("Folder", folder_row)
+        form.addRow("Name", self.name_edit)
 
-        self.godot_checkbox = QCheckBox("Export Godot resources")
-        self.godot_project_edit = QLineEdit()
+        what_box = QGroupBox("What do you want to export?")
+        what = QVBoxLayout(what_box)
+        what.setSpacing(6)
+        png_box = QCheckBox("Atlas image (PNG)  - always created")
+        png_box.setChecked(True)
+        png_box.setEnabled(False)
+        self.json_cb = self._bound_checkbox("JSON atlas data  (PixiJS / generic)", tab.export_json_checkbox)
+        self.godot_tex_cb = self._bound_checkbox("Godot: AtlasTexture .tres for each sprite", tab.godot_atlas_textures_checkbox)
+        self.godot_frames_cb = self._bound_checkbox("Godot: SpriteFrames .tres for AnimatedSprite2D", tab.godot_sprite_frames_checkbox)
+        self.ktx2_cb = self._bound_checkbox("KTX2 GPU texture  (needs the ktx tool)", tab.export_ktx2_checkbox)
+        for widget in (png_box, self.json_cb, self.godot_tex_cb, self.godot_frames_cb, self.ktx2_cb):
+            what.addWidget(widget)
+
+        self.godot_project_edit = QLineEdit(tab.godot_project_edit.text())
         self.godot_project_edit.setPlaceholderText("Folder containing project.godot")
-        self.godot_output_edit = QLineEdit()
-        self.godot_output_edit.setPlaceholderText("Folder inside the project for .tres files")
-        self.godot_atlas_textures_checkbox = QCheckBox("AtlasTexture .tres per sprite")
-        self.godot_atlas_textures_checkbox.setChecked(True)
-        self.godot_sprite_frames_checkbox = QCheckBox("SpriteFrames .tres (AnimatedSprite2D)")
-        self.godot_sprite_frames_checkbox.setChecked(True)
+        self.godot_project_edit.textChanged.connect(tab.godot_project_edit.setText)
+        self.godot_project_edit.textChanged.connect(lambda _text: self.refresh())
+        project_browse = QPushButton("Browse")
+        project_browse.clicked.connect(self._select_godot_project)
         self.godot_fps_spin = QSpinBox()
         self.godot_fps_spin.setRange(1, 240)
-        self.godot_fps_spin.setValue(12)
-        project_browse = QPushButton("Browse")
-        project_browse.clicked.connect(lambda: self._select_dir(self.godot_project_edit))
-        godot_out_browse = QPushButton("Browse")
-        godot_out_browse.clicked.connect(lambda: self._select_dir(self.godot_output_edit))
-        form.addRow("", self.godot_checkbox)
-        form.addRow("Godot Project", self._row(self.godot_project_edit, project_browse))
-        form.addRow("Godot Output", self._row(self.godot_output_edit, godot_out_browse))
-        form.addRow("", self.godot_atlas_textures_checkbox)
-        form.addRow("", self.godot_sprite_frames_checkbox)
-        form.addRow("SpriteFrames FPS", self.godot_fps_spin)
+        self.godot_fps_spin.setSuffix(" fps")
+        self.godot_fps_spin.setValue(tab.godot_fps_spin.value())
+        self.godot_fps_spin.valueChanged.connect(tab.godot_fps_spin.setValue)
+        self.godot_box = QWidget()
+        godot_form = QFormLayout(self.godot_box)
+        godot_form.setContentsMargins(24, 4, 0, 0)
+        project_row = QWidget()
+        project_layout = QHBoxLayout(project_row)
+        project_layout.setContentsMargins(0, 0, 0, 0)
+        project_layout.addWidget(self.godot_project_edit, 1)
+        project_layout.addWidget(project_browse)
+        godot_form.addRow("Godot project", project_row)
+        godot_form.addRow("Animation speed", self.godot_fps_spin)
+        what.addWidget(self.godot_box)
 
-        buttons = QHBoxLayout()
+        self.files_label = QLabel()
+        self.files_label.setTextFormat(Qt.RichText)
+        self.files_label.setWordWrap(True)
+        self.files_label.setObjectName("exportFiles")
+        self.notes_label = QLabel()
+        self.notes_label.setTextFormat(Qt.RichText)
+        self.notes_label.setWordWrap(True)
+        self.notes_label.setObjectName("exportNotes")
+        self.problems_label = QLabel()
+        self.problems_label.setTextFormat(Qt.RichText)
+        self.problems_label.setWordWrap(True)
+        self.problems_label.setObjectName("exportProblems")
+
         cancel_button = QPushButton("Cancel")
-        ok_button = QPushButton("Export")
+        self.ok_button = QPushButton("Export")
+        self.ok_button.setObjectName("primaryButton")
+        self.ok_button.setDefault(True)
         cancel_button.clicked.connect(self.reject)
-        ok_button.clicked.connect(self.accept)
+        self.ok_button.clicked.connect(self.accept)
+        buttons = QHBoxLayout()
         buttons.addStretch(1)
         buttons.addWidget(cancel_button)
-        buttons.addWidget(ok_button)
+        buttons.addWidget(self.ok_button)
 
         layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.addWidget(title)
+        layout.addWidget(intro)
         layout.addLayout(form)
+        layout.addWidget(what_box)
+        layout.addWidget(self.files_label)
+        layout.addWidget(self.notes_label)
+        layout.addWidget(self.problems_label)
         layout.addLayout(buttons)
 
-    def _select_dir(self, target: QLineEdit) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select Folder", target.text().strip())
-        if path:
-            target.setText(path)
-
-    def godot_values(self) -> GodotSettings:
-        return GodotSettings(
-            enabled=self.godot_checkbox.isChecked(),
-            project_dir=self.godot_project_edit.text().strip(),
-            output_dir=self.godot_output_edit.text().strip(),
-            atlas_textures=self.godot_atlas_textures_checkbox.isChecked(),
-            sprite_frames=self.godot_sprite_frames_checkbox.isChecked(),
-            fps=self.godot_fps_spin.value(),
+        self.setStyleSheet(
+            """
+            QLabel#dialogTitle { font-size: 16px; font-weight: 600; }
+            QLabel#hint { color: #8fa4b8; font-size: 12px; }
+            QLabel#exportFiles { background: #17212b; border: 1px solid #283646; border-radius: 8px; padding: 10px 12px; }
+            QLabel#exportNotes { color: #e0b84a; }
+            QLabel#exportProblems { color: #ff7b72; }
+            QPushButton#primaryButton { background: #2f6fed; color: white; border: 0; border-radius: 6px; padding: 8px 20px; font-weight: 600; }
+            QPushButton#primaryButton:hover { background: #4682f4; }
+            QPushButton#primaryButton:disabled { background: #2b3a4a; color: #7b8a99; }
+            """
         )
+        self.folder_edit.textChanged.connect(self.refresh)
+        self.name_edit.textChanged.connect(self.refresh)
+        self.refresh()
 
-    def _row(self, edit: QLineEdit, button: QPushButton) -> QWidget:
-        widget = QWidget()
-        layout = QHBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(edit)
-        layout.addWidget(button)
-        return widget
+    def _fit_height(self) -> None:
+        self.layout().activate()
+        self.resize(self.width(), max(self.minimumSizeHint().height(), self.layout().totalHeightForWidth(self.width())))
 
-    def _select_file(self, target: QLineEdit, file_filter: str) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "Save As", target.text().strip(), file_filter)
+    def _bound_checkbox(self, text: str, state: QCheckBox) -> QCheckBox:
+        # Mirrors a checkbox kept on the tab so the choice is remembered after the dialog closes.
+        box = QCheckBox(text)
+        box.setChecked(state.isChecked())
+        box.toggled.connect(state.setChecked)
+        box.toggled.connect(lambda _checked: self.refresh())
+        return box
+
+    def _select_godot_project(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select Godot Project Folder", self.godot_project_edit.text().strip())
         if path:
-            target.setText(path)
+            self.godot_project_edit.setText(path)
 
-    def values(self) -> tuple[str, str, bool, str]:
-        return (
-            self.output_image_edit.text().strip(),
-            self.output_json_edit.text().strip(),
-            self.ktx2_checkbox.isChecked(),
-            self.output_ktx2_edit.text().strip(),
-        )
+    def _select_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Choose Output Folder", self.folder_edit.text().strip())
+        if path:
+            self.folder_edit.setText(path)
+
+    def refresh(self) -> None:
+        self.godot_box.setVisible(self.godot_tex_cb.isChecked() or self.godot_frames_cb.isChecked())
+        files, problems, notes = self._plan(self.folder_edit.text(), self.name_edit.text())
+        if files:
+            rows = "".join(
+                f"<tr><td style='padding-right:14px'><b>{escape(label)}</b></td><td>{escape(path)}</td></tr>"
+                for label, path in files
+            )
+            self.files_label.setText(f"<div style='margin-bottom:6px'>Will be created:</div><table>{rows}</table>")
+        else:
+            self.files_label.setText("Nothing to export yet.")
+        self.notes_label.setText("<br>".join("&#9888; " + escape(note) for note in notes))
+        self.notes_label.setVisible(bool(notes))
+        self.problems_label.setText("<br>".join("&#10005; " + escape(problem) for problem in problems))
+        self.problems_label.setVisible(bool(problems))
+        self.ok_button.setEnabled(not problems)
+        if self.isVisible():
+            # Grow or shrink with the content (Godot rows and messages appear/disappear).
+            QTimer.singleShot(0, self._fit_height)
+
+    def values(self) -> tuple[str, str]:
+        return self.folder_edit.text().strip(), self.name_edit.text().strip()
 
 
 class ClickableImageLabel(QLabel):
@@ -343,17 +426,36 @@ class GenerateSheetTab(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.files_list = SpriteListWidget(self.add_files_from_drop)
-        self.output_image_edit = FileDropLineEdit("file")
-        self.output_json_edit = FileDropLineEdit("file")
-        self.output_ktx2_edit = FileDropLineEdit("file")
+        self.export_folder = ""
+        self.export_name = "sheet"
+        # These hold the choices made in the Export dialog (remembered between exports).
+        # They are never added to the settings UI.
+        self.export_json_checkbox = QCheckBox("Export JSON atlas data")
+        self.export_json_checkbox.setChecked(True)
+        self.godot_project_edit = FileDropLineEdit("dir")
+        self.godot_project_edit.setPlaceholderText("Folder containing project.godot")
+        self.godot_atlas_textures_checkbox = QCheckBox("AtlasTexture .tres for each sprite")
+        self.godot_sprite_frames_checkbox = QCheckBox("SpriteFrames .tres for AnimatedSprite2D")
+        self.godot_fps_spin = self._spin(1, 240, 12)
+        self.godot_fps_spin.setSuffix(" fps")
+        self.packing_hint = self._hint("")
+        self.guide_label = QLabel()
+        self.guide_label.setObjectName("guideBanner")
+        self.guide_label.setTextFormat(Qt.RichText)
+        self.guide_label.setWordWrap(True)
         self.name_pattern_edit = QLineEdit("{stem}.png")
         self.packing_combo = QComboBox()
         self.packing_combo.addItems(PACKING_ALGORITHMS)
         self.columns_spin = self._spin(0, 9999, 0)
+        self.columns_spin.setSpecialValueText("Auto")
         self.scale_spin = self._spin(1, 800, 100)
+        self.scale_spin.setSuffix(" %")
         self.downscale_spin = self._spin(1, 100, 100)
+        self.downscale_spin.setSuffix(" %")
         self.shape_padding_spin = self._spin(0, 4096, 0)
+        self.shape_padding_spin.setSuffix(" px")
         self.border_padding_spin = self._spin(0, 4096, 0)
+        self.border_padding_spin.setSuffix(" px")
         self.trim_checkbox = QCheckBox("Trim transparent bounds")
         self.pot_checkbox = QCheckBox("Use power-of-two sheet size")
         self.export_ktx2_checkbox = QCheckBox("KTX2 Export")
@@ -407,7 +509,13 @@ class GenerateSheetTab(QMainWindow):
             | QMainWindow.AllowTabbedDocks
             | QMainWindow.AnimatedDocks
         )
-        self.setCentralWidget(self.preview)
+        center = QWidget()
+        center_layout = QVBoxLayout(center)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(0)
+        center_layout.addWidget(self.guide_label)
+        center_layout.addWidget(self.preview, 1)
+        self.setCentralWidget(center)
 
         source_dock = QDockWidget("Sources", self)
         source_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
@@ -428,11 +536,13 @@ class GenerateSheetTab(QMainWindow):
         source_dock.setMinimumWidth(320)
         settings_dock.setMinimumWidth(340)
         console_dock.setMinimumHeight(140)
+        self.resizeDocks([source_dock, settings_dock], [300, 400], Qt.Horizontal)
 
         toolbar = QToolBar("Tab Actions", self)
         toolbar.setMovable(True)
         self.addToolBar(Qt.TopToolBarArea, toolbar)
         export_button = self._toolbar_button("Export...")
+        export_button.setObjectName("primaryButton")
         export_button.clicked.connect(self.open_export_dialog)
         refresh_button = self._toolbar_button("Refresh Preview")
         refresh_button.clicked.connect(self.update_preview)
@@ -447,56 +557,42 @@ class GenerateSheetTab(QMainWindow):
 
         self.setStyleSheet(
             """
-            QDockWidget { color: #eef3f8; font-weight: 700; }
+            QDockWidget { color: #eef3f8; font-weight: 600; }
             QDockWidget::title {
                 background: #19232d;
                 padding: 8px 10px;
                 text-align: left;
                 border-bottom: 1px solid #32414b;
             }
-            QToolBar {
-                background: #19232d;
-                border-bottom: 1px solid #32414b;
-                spacing: 8px;
-                padding: 8px;
-            }
+            QToolBar { background: #19232d; border-bottom: 1px solid #32414b; spacing: 8px; padding: 6px 8px; }
             QToolButton#toolbarButton {
-                background: #253340;
-                color: #eef3f8;
-                border: 1px solid #32414b;
-                border-radius: 6px;
-                padding: 5px 9px;
-                font-weight: 600;
+                background: #253340; color: #eef3f8; border: 1px solid #32414b;
+                border-radius: 6px; padding: 6px 12px; font-weight: 500;
             }
             QToolButton#toolbarButton:hover { background: #32414b; }
-            QGroupBox {
-                border: 1px solid #32414b;
-                border-radius: 10px;
-                margin-top: 10px;
-                padding-top: 12px;
-                background: #19232d;
-                color: #edf3f8;
-                font-weight: 600;
+            QToolButton#primaryButton {
+                background: #2f6fed; color: white; border: 0; border-radius: 6px;
+                padding: 7px 18px; font-weight: 600;
             }
-            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; }
+            QToolButton#primaryButton:hover { background: #4682f4; }
+            QLabel#guideBanner {
+                background: #1b2b3d; color: #dbe7f3; border-bottom: 1px solid #2d3f55;
+                padding: 10px 16px; font-size: 13px;
+            }
+            QLabel#hint { color: #8fa4b8; font-size: 11px; }
+            QGroupBox {
+                border: 1px solid #2d3947; border-radius: 8px; margin-top: 14px;
+                padding: 14px 10px 10px 10px; background: #17212b; color: #edf3f8; font-weight: 600;
+            }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 6px; color: #9fb6cc; }
+            QGroupBox QLabel, QGroupBox QCheckBox { font-weight: 400; }
             QPushButton {
-                background: #253340;
-                color: #eef3f8;
-                border: 1px solid #32414b;
-                border-radius: 8px;
-                padding: 8px 12px;
-                font-weight: 600;
+                background: #253340; color: #eef3f8; border: 1px solid #32414b;
+                border-radius: 6px; padding: 6px 12px; font-weight: 500;
             }
             QPushButton:hover { background: #32414b; }
-            QPushButton#helpButton {
-                min-width: 22px;
-                max-width: 22px;
-                min-height: 22px;
-                max-height: 22px;
-                padding: 0;
-                border-radius: 11px;
-                font-weight: 700;
-            }
+            QTabBar::tab { padding: 8px 14px; color: #9fb6cc; }
+            QTabBar::tab:selected { color: #ffffff; border-bottom: 2px solid #2f6fed; }
             QTextEdit { font-family: monospace; }
             """
         )
@@ -549,72 +645,218 @@ class GenerateSheetTab(QMainWindow):
         files_layout.addLayout(file_buttons)
         files_layout.addLayout(edit_buttons)
         files_layout.addWidget(self.files_list)
-        files_layout.addWidget(QLabel("Tip: drag files or spacers in the list, or drag sprites on the atlas preview."))
+        files_layout.addWidget(self._hint("Drag rows to reorder. A spacer adds an empty (optionally colored) cell to group sprites."))
         layout.addWidget(files_box)
         return widget
 
-    def _build_settings_panel(self) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
+    def _hint(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("hint")
+        label.setWordWrap(True)
+        return label
 
-        atlas_box = QGroupBox("Atlas")
-        atlas_form = QFormLayout(atlas_box)
-        atlas_form.addRow(build_help_label("Packing", "Grid keeps source order cells. Basic uses shelf packing. MaxRects packs rectangles tightly. Polygon adds alpha-outline metadata with MaxRects-style placement."), build_help_field(self.packing_combo, "Grid keeps source order cells. Basic uses shelf packing. MaxRects packs rectangles tightly. Polygon adds alpha-outline metadata with MaxRects-style placement."))
-        atlas_form.addRow(build_help_label("Columns (0 = auto)", "Use 0 to let the tool choose a near-square grid automatically."), build_help_field(self.columns_spin, "Use 0 to let the tool choose a near-square grid automatically."))
-        atlas_form.addRow(build_help_label("Prescale %", "Scales source sprites before trimming and packing."), build_help_field(self.scale_spin, "Scales source sprites before trimming and packing."))
-        atlas_form.addRow(build_help_label("Export Downscale %", "Scales the final atlas and JSON frame coordinates during export."), build_help_field(self.downscale_spin, "Scales the final atlas and JSON frame coordinates during export."))
-        atlas_form.addRow(build_help_label("Shape Padding", "Adds spacing between sprite cells."), build_help_field(self.shape_padding_spin, "Adds spacing between sprite cells."))
-        atlas_form.addRow(build_help_label("Border Padding", "Adds spacing around the outer sheet border."), build_help_field(self.border_padding_spin, "Adds spacing around the outer sheet border."))
-        atlas_form.addRow(build_help_label("Sprite Name Pattern", "Controls frame names. Variables: {stem}, {index}, {name}, {ext}"), build_help_field(self.name_pattern_edit, "Controls frame names. Variables: {stem}, {index}, {name}, {ext}"))
-        atlas_form.addRow(build_help_label("JSON Format", "Choose PixiJS frame layout: hash or array."), build_help_field(self.data_format_combo, "Choose PixiJS frame layout: hash or array."))
-        atlas_form.addRow("", self.trim_checkbox)
-        atlas_form.addRow("", self.pot_checkbox)
+    def _field(self, widget: QWidget, hint: str = "") -> QWidget:
+        # A control with an always-visible one-line explanation underneath it.
+        if not hint:
+            return widget
+        widget.setToolTip(hint)
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(widget)
+        layout.addWidget(self._hint(hint))
+        return box
 
-        optimize_box = QGroupBox("PNG Optimization")
-        optimize_form = QFormLayout(optimize_box)
-        optimize_form.addRow(build_help_label("Pixel Format", "Simulates the selected pixel format in the exported PNG."), build_help_field(self.pixel_format_combo, "Simulates the selected pixel format in the exported PNG."))
-        optimize_form.addRow("", self.pngquant_checkbox)
-        optimize_form.addRow(build_help_label("pngquant Path", "Path to the pngquant executable."), build_browse_field(self.pngquant_path_edit, "Browse", lambda: self._select_tool_path(self.pngquant_path_edit), "Path to the pngquant executable."))
-        optimize_form.addRow(build_help_label("pngquant Quality Min", "Minimum pngquant quality."), build_help_field(self.pngquant_quality_min_spin, "Minimum pngquant quality."))
-        optimize_form.addRow(build_help_label("pngquant Quality Max", "Maximum pngquant quality."), build_help_field(self.pngquant_quality_max_spin, "Maximum pngquant quality."))
-        optimize_form.addRow(build_help_label("pngquant Speed", "pngquant speed from 1 slowest to 11 fastest."), build_help_field(self.pngquant_speed_spin, "pngquant speed from 1 slowest to 11 fastest."))
-        optimize_form.addRow("", self.zopfli_checkbox)
-        optimize_form.addRow(build_help_label("Zopfli Path", "Path to the zopflipng executable."), build_browse_field(self.zopfli_path_edit, "Browse", lambda: self._select_tool_path(self.zopfli_path_edit), "Path to the zopflipng executable."))
-        optimize_form.addRow(build_help_label("Zopfli Iterations", "More iterations can improve compression but slow export."), build_help_field(self.zopfli_iterations_spin, "More iterations can improve compression but slow export."))
+    def _group(self, title: str):
+        box = QGroupBox(title)
+        form = QFormLayout(box)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(10)
+        return box, form
 
-        ktx_box = QGroupBox("KTX2")
-        ktx_form = QFormLayout(ktx_box)
-        ktx_form.addRow("", self.export_ktx2_checkbox)
-        ktx_form.addRow(build_help_label("KTX2 Mode", "UASTC favors visual quality and faster transcoding. ETC1S favors smaller files."), build_help_field(self.ktx2_mode_combo, "UASTC favors visual quality and faster transcoding. ETC1S favors smaller files."))
-        ktx_form.addRow("", self.generate_mipmaps_checkbox)
-        ktx_form.addRow(build_help_label("Mipmap Filter", "Filter used while generating mipmap levels."), build_help_field(self.mipmap_filter_combo, "Filter used while generating mipmap levels."))
-        ktx_form.addRow("", self.use_ktx2_in_json_checkbox)
-        ktx_form.addRow(build_help_label("ktx Path", "Path to the modern KTX-Software `ktx` tool."), build_help_field(self.ktx_path_edit, "Path to the modern KTX-Software `ktx` tool. Click the help button to open official KTX releases."))
+    def _scroll(self, widget: QWidget) -> QScrollArea:
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.NoFrame)
+        area.setWidget(widget)
+        return area
 
-        paths_box = QGroupBox("Default Output Paths")
-        paths_form = QFormLayout(paths_box)
-        paths_form.addRow(
-            build_help_label("Sheet PNG", "Default output path used by the export dialog."),
-            build_browse_field(self.output_image_edit, "Browse", lambda: self._select_save_path(self.output_image_edit, "PNG (*.png)"), "Default output path used by the export dialog."),
-        )
-        paths_form.addRow(
-            build_help_label("PixiJS JSON", "Default JSON path used by the export dialog."),
-            build_browse_field(self.output_json_edit, "Browse", lambda: self._select_save_path(self.output_json_edit, "JSON (*.json)"), "Default JSON path used by the export dialog."),
-        )
-        paths_form.addRow(
-            build_help_label("KTX2", "Default KTX2 path used by the export dialog."),
-            build_browse_field(self.output_ktx2_edit, "Browse", lambda: self._select_save_path(self.output_ktx2_edit, "KTX2 (*.ktx2)"), "Default KTX2 path used by the export dialog."),
-        )
-
-        layout.addWidget(atlas_box)
-        layout.addWidget(optimize_box)
-        layout.addWidget(ktx_box)
-        layout.addWidget(paths_box)
+    def _tab_page(self, intro: str, *boxes: QWidget) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(10, 12, 10, 12)
+        layout.setSpacing(12)
+        layout.addWidget(self._hint(intro))
+        for box in boxes:
+            layout.addWidget(box)
         layout.addStretch(1)
-        return widget
+        return page
+
+    def _build_settings_panel(self) -> QWidget:
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+        tabs.addTab(self._scroll(self._build_layout_tab()), "1  Layout")
+        tabs.addTab(self._scroll(self._build_export_tab()), "2  Export")
+        tabs.addTab(self._scroll(self._build_optimize_tab()), "3  Optimize")
+        return tabs
+
+    def _build_layout_tab(self) -> QWidget:
+        packing_box, packing = self._group("Packing")
+        packing.addRow("Method", self.packing_combo)
+        packing.addRow("", self.packing_hint)
+        packing.addRow("Columns", self._field(self.columns_spin, "Auto picks a near-square grid."))
+        packing.addRow("Space between", self._field(self.shape_padding_spin, "Pixels between sprites. 1-2 px avoids edge bleeding when scaled."))
+        packing.addRow("Edge margin", self._field(self.border_padding_spin, "Empty pixels around the whole atlas."))
+        packing.addRow("", self.pot_checkbox)
+
+        sprite_box, sprites = self._group("Sprites")
+        sprites.addRow("Scale", self._field(self.scale_spin, "Resizes every source sprite before packing."))
+        sprites.addRow("", self.trim_checkbox)
+        sprites.addRow("Frame names", self._field(self.name_pattern_edit, "Variables: {stem} {index} {name} {ext}. For Godot animations name sprites walk_0, walk_1, ..."))
+        return self._tab_page("Decide how sprites are arranged. The preview updates as you change things.", packing_box, sprite_box)
+
+    def _build_export_tab(self) -> QWidget:
+        size_box, size = self._group("Final size")
+        size.addRow("Downscale", self._field(self.downscale_spin, "Shrinks the finished atlas and all frame coordinates. 100% keeps full size."))
+
+        json_box, json_form = self._group("JSON atlas data")
+        json_form.addRow("Layout", self._field(self.data_format_combo, "hash: frames keyed by name. array: list of frames."))
+
+        ktx_box, ktx = self._group("KTX2 (GPU texture)")
+        ktx.addRow("Quality", self._field(self.ktx2_mode_combo, "UASTC: higher quality. ETC1S: smaller files."))
+        ktx.addRow("", self.generate_mipmaps_checkbox)
+        ktx.addRow("Mipmap filter", self.mipmap_filter_combo)
+        ktx.addRow("", self.use_ktx2_in_json_checkbox)
+        ktx.addRow("ktx tool", self._field(self.ktx_path_edit, "Needs KTX-Software installed (click ? for downloads)."))
+
+        return self._tab_page("How exported files look. Choose which files to create when you press Export...", size_box, json_box, ktx_box)
+
+    def _build_optimize_tab(self) -> QWidget:
+        quality_box, quality = self._group("Color")
+        quality.addRow("Pixel format", self._field(self.pixel_format_combo, "RGBA8888 is full quality. Lower formats shrink color depth to simulate mobile GPU formats."))
+
+        pngquant_box, pngquant = self._group("pngquant (smaller PNG)")
+        pngquant.addRow(self.pngquant_checkbox)
+        self.pngquant_path_row = build_browse_field(self.pngquant_path_edit, "Browse", lambda: self._select_tool_path(self.pngquant_path_edit), "")
+        pngquant.addRow("Program", self.pngquant_path_row)
+        pngquant.addRow("Min quality", self.pngquant_quality_min_spin)
+        pngquant.addRow("Max quality", self.pngquant_quality_max_spin)
+        pngquant.addRow("Speed", self._field(self.pngquant_speed_spin, "1 is slowest and best, 11 is fastest."))
+
+        zopfli_box, zopfli = self._group("Zopfli (lossless squeeze)")
+        zopfli.addRow(self.zopfli_checkbox)
+        self.zopfli_path_row = build_browse_field(self.zopfli_path_edit, "Browse", lambda: self._select_tool_path(self.zopfli_path_edit), "")
+        zopfli.addRow("Program", self.zopfli_path_row)
+        zopfli.addRow("Iterations", self._field(self.zopfli_iterations_spin, "More iterations: smaller file, slower export."))
+
+        self._pngquant_dependents = [self.pngquant_path_row, self.pngquant_quality_min_spin, self.pngquant_quality_max_spin, self.pngquant_speed_spin]
+        self._zopfli_dependents = [self.zopfli_path_row, self.zopfli_iterations_spin]
+        return self._tab_page("Optional. Leave everything off for a plain PNG. These tools must be installed separately.", quality_box, pngquant_box, zopfli_box)
+
+    def _sync_target_ui(self) -> None:
+        for widget in self._pngquant_dependents:
+            widget.setEnabled(self.pngquant_checkbox.isChecked())
+        for widget in self._zopfli_dependents:
+            widget.setEnabled(self.zopfli_checkbox.isChecked())
+
+    def _update_packing_hint(self) -> None:
+        self.packing_hint.setText(PACKING_HINTS.get(self.packing_combo.currentText(), ""))
+
+    def _select_godot_project(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select Godot Project Folder", self.godot_project_edit.text().strip())
+        if path:
+            self.godot_project_edit.setText(path)
+
+    @staticmethod
+    def _find_godot_project(start: str) -> str:
+        current = os.path.abspath(start)
+        while True:
+            if os.path.isfile(os.path.join(current, "project.godot")):
+                return current
+            parent = os.path.dirname(current)
+            if parent == current:
+                return ""
+            current = parent
+
+    def _update_guide(self, message: str = "") -> None:
+        count = len(self._collect_real_file_paths())
+        if message:
+            text = f"<b>Something needs attention:</b> {escape(message)}"
+        elif count == 0:
+            text = "<b>Step 1</b> &nbsp;Add your sprites: click <b>Add Files</b> or drag images into the Sources list."
+        else:
+            text = (
+                f"<b>{count} sprite{'s' if count != 1 else ''} ready.</b> &nbsp;"
+                "<b>Step 2</b> adjust Layout in Settings, check the preview. &nbsp;"
+                "<b>Step 3</b> press <b>Export...</b>"
+            )
+        self.guide_label.setText(text)
+
+    def _tool_available(self, path: str) -> bool:
+        path = path.strip()
+        return bool(path) and bool(shutil.which(path) or os.path.isfile(path))
+
+    def _export_plan(self, folder: str, name: str):
+        # Returns (files to create, blocking problems, non-blocking notes) for the dialog.
+        files: List[tuple[str, str]] = []
+        problems: List[str] = []
+        notes: List[str] = []
+        folder = folder.strip()
+        name = name.strip()
+        if not self._collect_real_file_paths():
+            problems.append("Add at least one sprite first.")
+        if not folder:
+            problems.append("Choose an output folder.")
+        if not name:
+            problems.append("Enter a file name.")
+        elif re.search(r'[\\/:*?"<>|]', name):
+            problems.append('The name cannot contain \\ / : * ? " < > |')
+        if not folder or not name:
+            return files, problems, notes
+
+        base = os.path.join(folder, name)
+        files.append(("Atlas PNG", base + ".png"))
+        if self.export_json_checkbox.isChecked():
+            files.append(("PixiJS JSON", base + ".json"))
+        if self.export_ktx2_checkbox.isChecked():
+            files.append(("KTX2", base + ".ktx2"))
+            if not self._tool_available(self.ktx_path_edit.text()):
+                problems.append("KTX2 is ticked but the ktx tool was not found. Set its path in Settings > Export.")
+        if self.godot_atlas_textures_checkbox.isChecked() or self.godot_sprite_frames_checkbox.isChecked():
+            project = self.godot_project_edit.text().strip()
+            kinds = []
+            if self.godot_atlas_textures_checkbox.isChecked():
+                kinds.append("AtlasTexture per sprite")
+            if self.godot_sprite_frames_checkbox.isChecked():
+                kinds.append("SpriteFrames")
+            if not project:
+                problems.append("Choose the Godot project folder.")
+            elif not os.path.isfile(os.path.join(project, "project.godot")):
+                problems.append("The Godot project folder does not contain project.godot.")
+            else:
+                try:
+                    res_path_for(base + ".png", project)
+                except ValueError:
+                    problems.append("For Godot, the output folder must be inside the project folder.")
+            files.append(("Godot", f"{base}_godot/  ({', '.join(kinds)})"))
+        if self.pngquant_checkbox.isChecked() and not self._tool_available(self.pngquant_path_edit.text()):
+            problems.append("pngquant is on but was not found. Set its path in Settings > Optimize.")
+        if self.zopfli_checkbox.isChecked() and not self._tool_available(self.zopfli_path_edit.text()):
+            problems.append("Zopfli is on but zopflipng was not found. Set its path in Settings > Optimize.")
+        for label, path in files:
+            if os.path.isfile(path):
+                notes.append(f"{os.path.basename(path)} already exists and will be replaced.")
+        return files, problems, notes
+
 
     def _connect_signals(self) -> None:
+        self.packing_combo.currentTextChanged.connect(self._update_packing_hint)
         self.packing_combo.currentTextChanged.connect(self.update_preview)
+        for checkbox in (self.pngquant_checkbox, self.zopfli_checkbox):
+            checkbox.toggled.connect(self._sync_target_ui)
         self.columns_spin.valueChanged.connect(self.update_preview)
         self.scale_spin.valueChanged.connect(self.update_preview)
         self.shape_padding_spin.valueChanged.connect(self.update_preview)
@@ -623,11 +865,11 @@ class GenerateSheetTab(QMainWindow):
         self.trim_checkbox.toggled.connect(self.update_preview)
         self.pot_checkbox.toggled.connect(self.update_preview)
         self.pixel_format_combo.currentTextChanged.connect(self.update_preview)
-        self.export_ktx2_checkbox.toggled.connect(self._sync_ktx2_ui)
         self.generate_mipmaps_checkbox.toggled.connect(self._sync_ktx2_ui)
-        self.use_ktx2_in_json_checkbox.toggled.connect(self._sync_ktx2_ui)
         self.files_list.model().rowsMoved.connect(lambda *_: self.update_preview())
         self._sync_ktx2_ui()
+        self._sync_target_ui()
+        self._update_packing_hint()
         self.update_preview()
 
     def _collect_file_paths(self) -> List[Optional[str]]:
@@ -732,15 +974,15 @@ class GenerateSheetTab(QMainWindow):
         existing = {path for path in self._collect_file_paths() if path}
         for file_path in files:
             if file_path not in existing:
-                item = QListWidgetItem(file_path)
+                item = QListWidgetItem(os.path.basename(file_path))
+                item.setToolTip(file_path)
                 item.setData(ITEM_KIND_ROLE, "file")
                 item.setData(ITEM_PATH_ROLE, file_path)
                 self.files_list.addItem(item)
-        if files and not self.output_image_edit.text():
-            base_dir = os.path.dirname(files[0])
-            self.output_image_edit.setText(os.path.join(base_dir, "sheet.png"))
-            self.output_json_edit.setText(os.path.join(base_dir, "sheet.json"))
-            self.output_ktx2_edit.setText(os.path.join(base_dir, "sheet.ktx2"))
+        if files and not self.export_folder:
+            self.export_folder = os.path.dirname(files[0])
+        if files and not self.godot_project_edit.text().strip():
+            self.godot_project_edit.setText(self._find_godot_project(os.path.dirname(files[0])))
         self.update_preview()
 
     def toggle_checker_background(self) -> None:
@@ -884,15 +1126,7 @@ class GenerateSheetTab(QMainWindow):
         )
 
     def _sync_ktx2_ui(self) -> None:
-        enabled = self.export_ktx2_checkbox.isChecked()
-        self.ktx2_mode_combo.setEnabled(enabled)
-        self.generate_mipmaps_checkbox.setEnabled(enabled)
-        self.mipmap_filter_combo.setEnabled(enabled and self.generate_mipmaps_checkbox.isChecked())
-        self.ktx_path_edit.setEnabled(enabled)
-        self.use_ktx2_in_json_checkbox.setEnabled(enabled)
-        if not enabled:
-            self.generate_mipmaps_checkbox.setChecked(False)
-            self.use_ktx2_in_json_checkbox.setChecked(False)
+        self.mipmap_filter_combo.setEnabled(self.generate_mipmaps_checkbox.isChecked())
 
     def log_message(self, message: str) -> None:
         self.log.append(message)
@@ -900,6 +1134,7 @@ class GenerateSheetTab(QMainWindow):
     def update_preview(self) -> None:
         try:
             file_paths = self._collect_file_paths()
+            self._update_guide()
             if not file_paths:
                 self.preview.set_preview(None, [], "Waiting for source sprites.", region_labels=[])
                 return
@@ -933,6 +1168,7 @@ class GenerateSheetTab(QMainWindow):
                 region_labels=self._region_labels(),
             )
         except Exception as exc:
+            self._update_guide(str(exc))
             self.preview.set_preview(
                 None,
                 [],
@@ -942,17 +1178,29 @@ class GenerateSheetTab(QMainWindow):
             )
 
     def open_export_dialog(self) -> None:
-        dialog = GenerateExportDialog(
-            self,
-            self.output_image_edit.text().strip(),
-            self.output_json_edit.text().strip(),
-            self.output_ktx2_edit.text().strip(),
-            self.export_ktx2_checkbox.isChecked(),
-        )
+        dialog = GenerateExportDialog(self, self.export_folder, self.export_name, self._export_plan, self)
         if dialog.exec_() != QDialog.Accepted:
             return
-        output_image, output_json, export_ktx2, output_ktx2 = dialog.values()
-        self.export_sheet(output_image, output_json, export_ktx2, output_ktx2, dialog.godot_values())
+        folder, name = dialog.values()
+        self.export_folder, self.export_name = folder, name
+        base = os.path.join(folder, name)
+        godot = None
+        if self.godot_atlas_textures_checkbox.isChecked() or self.godot_sprite_frames_checkbox.isChecked():
+            godot = GodotSettings(
+                enabled=True,
+                project_dir=self.godot_project_edit.text().strip(),
+                output_dir=f"{base}_godot",
+                atlas_textures=self.godot_atlas_textures_checkbox.isChecked(),
+                sprite_frames=self.godot_sprite_frames_checkbox.isChecked(),
+                fps=self.godot_fps_spin.value(),
+            )
+        self.export_sheet(
+            base + ".png",
+            base + ".json" if self.export_json_checkbox.isChecked() else "",
+            self.export_ktx2_checkbox.isChecked(),
+            base + ".ktx2",
+            godot,
+        )
 
     def export_sheet(
         self,
@@ -964,8 +1212,8 @@ class GenerateSheetTab(QMainWindow):
     ) -> None:
         self.log.clear()
         try:
-            if not output_image or not output_json:
-                raise ValueError("You must set both the sheet PNG path and JSON path.")
+            if not output_image:
+                raise ValueError("You must set the sheet PNG path.")
             if export_ktx2 and not output_ktx2:
                 raise ValueError("KTX2 output path is required when KTX2 export is enabled.")
             godot_atlas_res = ""
@@ -992,7 +1240,8 @@ class GenerateSheetTab(QMainWindow):
                 packing_algorithm=self.packing_combo.currentText(),
             )
             os.makedirs(os.path.dirname(output_image) or ".", exist_ok=True)
-            os.makedirs(os.path.dirname(output_json) or ".", exist_ok=True)
+            if output_json:
+                os.makedirs(os.path.dirname(output_json) or ".", exist_ok=True)
             optimization = self._build_optimization_settings()
             # Export transforms happen after packing: downscale image/frames
             # together, simulate pixel format, then run optional PNG compressors.
@@ -1016,17 +1265,18 @@ class GenerateSheetTab(QMainWindow):
                 self.log_message(f"KTX2 created: {ktx2.output_path}")
                 self.log_message(f"ktx: {command_text}")
 
-            json_image_name = os.path.basename(ktx2.output_path) if ktx2.use_in_json else os.path.basename(output_image)
-            pixi_data = build_pixi_data(
-                json_image_name,
-                export_sheet.width,
-                export_sheet.height,
-                export_frames,
-                self.data_format_combo.currentText(),
-                optimization.pixel_format,
-            )
-            with open(output_json, "w", encoding="utf-8") as handle:
-                json.dump(pixi_data, handle, indent=2)
+            if output_json:
+                json_image_name = os.path.basename(ktx2.output_path) if ktx2.use_in_json else os.path.basename(output_image)
+                pixi_data = build_pixi_data(
+                    json_image_name,
+                    export_sheet.width,
+                    export_sheet.height,
+                    export_frames,
+                    self.data_format_combo.currentText(),
+                    optimization.pixel_format,
+                )
+                with open(output_json, "w", encoding="utf-8") as handle:
+                    json.dump(pixi_data, handle, indent=2)
 
             if godot is not None and godot.enabled:
                 written = export_godot_resources(
@@ -1040,13 +1290,10 @@ class GenerateSheetTab(QMainWindow):
                 )
                 self.log_message(f"Godot resources: {len(written)} file(s) in {godot.output_dir}")
 
-            self.output_image_edit.setText(output_image)
-            self.output_json_edit.setText(output_json)
-            self.output_ktx2_edit.setText(output_ktx2)
-
             self.log_message(f"Sheet created: {output_image}")
-            self.log_message(f"PixiJS JSON created: {output_json}")
-            self.log_message(f"JSON format: {self.data_format_combo.currentText()}")
+            if output_json:
+                self.log_message(f"PixiJS JSON created: {output_json}")
+                self.log_message(f"JSON format: {self.data_format_combo.currentText()}")
             self.log_message(f"Sprite pattern: {self.name_pattern_edit.text().strip() or '{stem}.png'}")
             self.log_message(f"Layout: {columns} columns x {rows} rows")
             self.log_message(f"Cell size: {max_w}x{max_h}")
@@ -1062,9 +1309,30 @@ class GenerateSheetTab(QMainWindow):
             self.log_message(f"Power of Two: {'on' if self.pot_checkbox.isChecked() else 'off'}")
             self.log_message(f"KTX2: {'on' if ktx2.enabled else 'off'}")
             self.log_message(f"Mipmap: {'on' if ktx2.generate_mipmaps else 'off'}")
+            self._show_export_done(output_image, output_json, ktx2.output_path if ktx2.enabled else "", godot)
         except Exception as exc:
-            QMessageBox.critical(self, "Error", str(exc))
+            QMessageBox.critical(self, "Export failed", str(exc))
             self.log_message(f"Error: {exc}")
+
+    def _show_export_done(self, image: str, json_path: str, ktx2_path: str, godot: Optional[GodotSettings]) -> None:
+        lines = [f"Atlas: {os.path.basename(image)}"]
+        if json_path:
+            lines.append(f"JSON: {os.path.basename(json_path)}")
+        if ktx2_path:
+            lines.append(f"KTX2: {os.path.basename(ktx2_path)}")
+        if godot is not None and godot.enabled:
+            lines.append(f"Godot resources: {os.path.basename(godot.output_dir)}/")
+        folder = os.path.dirname(os.path.abspath(image))
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle("Export complete")
+        box.setText("Your atlas is ready.")
+        box.setInformativeText("\n".join(lines) + f"\n\nSaved in {folder}")
+        open_button = box.addButton("Open Folder", QMessageBox.ActionRole)
+        box.addButton("Close", QMessageBox.RejectRole)
+        box.exec_()
+        if box.clickedButton() is open_button:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
     def reorder_from_preview(self, source_frame: int, target_frame: int, insert_after: bool) -> None:
         if source_frame == target_frame:

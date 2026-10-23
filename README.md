@@ -57,14 +57,23 @@ python main.py
 6. Configure packing, padding, prescale, export downscale, pixel format, and optimization settings.
 7. Click `Export...` to write the PNG atlas and PixiJS JSON.
 
+## Choosing What To Export
+
+Press `Export...`, pick a folder and a name, then tick only the files you want. The atlas PNG is always created; the rest is optional and your choices are remembered:
+
+- `JSON atlas data` (PixiJS / generic).
+- `Godot: AtlasTexture .tres for each sprite`.
+- `Godot: SpriteFrames .tres for AnimatedSprite2D`.
+- `KTX2 GPU texture`.
+
+The dialog lists every file that will be created and blocks export while something is wrong (missing tool, Godot project not found, output folder outside the Godot project).
+
 ## Godot Export
 
-In the `Export...` dialog enable `Export Godot resources`, then set:
+When a Godot option is ticked, the dialog asks for the Godot project folder (the one with `project.godot`, auto-detected when your sprites are inside a project) and the animation speed. Save the atlas inside that project; it is referenced as `res://...`. The `.tres` files are written to `<name>_godot/`.
 
-- `Godot Project`: the folder containing `project.godot`. The atlas PNG must be saved inside it; it is referenced as `res://...`.
-- `Godot Output`: the folder where the `.tres` files are written.
-- `AtlasTexture .tres per sprite`: one resource per frame with `region` (and `margin` for trimmed sprites).
-- `SpriteFrames .tres`: frames are grouped into animations by name, so `walk_0`, `walk_1`, `walk_10` become the `walk` animation in numeric order. Names without a numeric suffix go to `default`. Use a name pattern such as `{stem}.png` with sources named like that.
+- `AtlasTexture`: one resource per frame with `region` (and `margin` for trimmed sprites).
+- `SpriteFrames`: frames are grouped into animations by name, so `walk_0`, `walk_1`, `walk_10` become the `walk` animation in numeric order. Names without a numeric suffix go to `default`.
 
 Godot imports the atlas PNG automatically when the editor regains focus. Export downscale is respected. Polygon `vertices` metadata is not exported to Godot.
 
