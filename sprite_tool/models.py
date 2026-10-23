@@ -28,6 +28,16 @@ class Ktx2Settings:
 
 
 @dataclass
+class GodotSettings:
+    enabled: bool
+    project_dir: str
+    output_dir: str
+    atlas_textures: bool
+    sprite_frames: bool
+    fps: int
+
+
+@dataclass
 class OptimizationSettings:
     pixel_format: str
     export_downscale_percent: int

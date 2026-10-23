@@ -21,6 +21,7 @@ Repository: https://github.com/merchizm/mgt-sprite-packing-tool
 - Optional PNG optimization with pngquant and zopflipng.
 - Optional KTX2 export with Khronos KTX-Software.
 - Split existing sheets by grid or alpha-detected regions.
+- Optional Godot 4 export: one `AtlasTexture` `.tres` per sprite and a `SpriteFrames` `.tres` for `AnimatedSprite2D`.
 
 ## Install
 
@@ -55,6 +56,17 @@ python main.py
 5. Use `Tools > Set Spacer Color` to color every spacer cell, including fully transparent spacers.
 6. Configure packing, padding, prescale, export downscale, pixel format, and optimization settings.
 7. Click `Export...` to write the PNG atlas and PixiJS JSON.
+
+## Godot Export
+
+In the `Export...` dialog enable `Export Godot resources`, then set:
+
+- `Godot Project`: the folder containing `project.godot`. The atlas PNG must be saved inside it; it is referenced as `res://...`.
+- `Godot Output`: the folder where the `.tres` files are written.
+- `AtlasTexture .tres per sprite`: one resource per frame with `region` (and `margin` for trimmed sprites).
+- `SpriteFrames .tres`: frames are grouped into animations by name, so `walk_0`, `walk_1`, `walk_10` become the `walk` animation in numeric order. Names without a numeric suffix go to `default`. Use a name pattern such as `{stem}.png` with sources named like that.
+
+Godot imports the atlas PNG automatically when the editor regains focus. Export downscale is respected. Polygon `vertices` metadata is not exported to Godot.
 
 ## Tools Menu
 

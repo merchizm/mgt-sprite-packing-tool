@@ -35,7 +35,8 @@ from PyQt5.QtWidgets import (
 )
 
 from sprite_tool.constants import IMAGE_FILTER, JSON_FORMATS, KTX2_MODES, MIPMAP_FILTERS, PACKING_ALGORITHMS, PIXEL_FORMATS
-from sprite_tool.models import Ktx2Settings, OptimizationSettings
+from sprite_tool.models import GodotSettings, Ktx2Settings, OptimizationSettings
+from sprite_tool.services.godot import export_godot_resources, res_path_for
 from sprite_tool.services.images import compose_sheet
 from sprite_tool.services.ktx2 import find_default_ktx_binary, run_ktx2_export
 from sprite_tool.services.optimization import (
@@ -77,6 +78,29 @@ class GenerateExportDialog(QDialog):
         form.addRow("", self.ktx2_checkbox)
         form.addRow("KTX2", self._row(self.output_ktx2_edit, ktx2_browse))
 
+        self.godot_checkbox = QCheckBox("Export Godot resources")
+        self.godot_project_edit = QLineEdit()
+        self.godot_project_edit.setPlaceholderText("Folder containing project.godot")
+        self.godot_output_edit = QLineEdit()
+        self.godot_output_edit.setPlaceholderText("Folder inside the project for .tres files")
+        self.godot_atlas_textures_checkbox = QCheckBox("AtlasTexture .tres per sprite")
+        self.godot_atlas_textures_checkbox.setChecked(True)
+        self.godot_sprite_frames_checkbox = QCheckBox("SpriteFrames .tres (AnimatedSprite2D)")
+        self.godot_sprite_frames_checkbox.setChecked(True)
+        self.godot_fps_spin = QSpinBox()
+        self.godot_fps_spin.setRange(1, 240)
+        self.godot_fps_spin.setValue(12)
+        project_browse = QPushButton("Browse")
+        project_browse.clicked.connect(lambda: self._select_dir(self.godot_project_edit))
+        godot_out_browse = QPushButton("Browse")
+        godot_out_browse.clicked.connect(lambda: self._select_dir(self.godot_output_edit))
+        form.addRow("", self.godot_checkbox)
+        form.addRow("Godot Project", self._row(self.godot_project_edit, project_browse))
+        form.addRow("Godot Output", self._row(self.godot_output_edit, godot_out_browse))
+        form.addRow("", self.godot_atlas_textures_checkbox)
+        form.addRow("", self.godot_sprite_frames_checkbox)
+        form.addRow("SpriteFrames FPS", self.godot_fps_spin)
+
         buttons = QHBoxLayout()
         cancel_button = QPushButton("Cancel")
         ok_button = QPushButton("Export")
@@ -89,6 +113,21 @@ class GenerateExportDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addLayout(buttons)
+
+    def _select_dir(self, target: QLineEdit) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select Folder", target.text().strip())
+        if path:
+            target.setText(path)
+
+    def godot_values(self) -> GodotSettings:
+        return GodotSettings(
+            enabled=self.godot_checkbox.isChecked(),
+            project_dir=self.godot_project_edit.text().strip(),
+            output_dir=self.godot_output_edit.text().strip(),
+            atlas_textures=self.godot_atlas_textures_checkbox.isChecked(),
+            sprite_frames=self.godot_sprite_frames_checkbox.isChecked(),
+            fps=self.godot_fps_spin.value(),
+        )
 
     def _row(self, edit: QLineEdit, button: QPushButton) -> QWidget:
         widget = QWidget()
@@ -913,15 +952,29 @@ class GenerateSheetTab(QMainWindow):
         if dialog.exec_() != QDialog.Accepted:
             return
         output_image, output_json, export_ktx2, output_ktx2 = dialog.values()
-        self.export_sheet(output_image, output_json, export_ktx2, output_ktx2)
+        self.export_sheet(output_image, output_json, export_ktx2, output_ktx2, dialog.godot_values())
 
-    def export_sheet(self, output_image: str, output_json: str, export_ktx2: bool, output_ktx2: str) -> None:
+    def export_sheet(
+        self,
+        output_image: str,
+        output_json: str,
+        export_ktx2: bool,
+        output_ktx2: str,
+        godot: Optional[GodotSettings] = None,
+    ) -> None:
         self.log.clear()
         try:
             if not output_image or not output_json:
                 raise ValueError("You must set both the sheet PNG path and JSON path.")
             if export_ktx2 and not output_ktx2:
                 raise ValueError("KTX2 output path is required when KTX2 export is enabled.")
+            godot_atlas_res = ""
+            if godot is not None and godot.enabled:
+                if not godot.project_dir or not godot.output_dir:
+                    raise ValueError("Set the Godot project folder and Godot output folder.")
+                if not (godot.atlas_textures or godot.sprite_frames):
+                    raise ValueError("Select at least one Godot resource type.")
+                godot_atlas_res = res_path_for(output_image, godot.project_dir)
 
             sheet, frames, columns, rows, max_w, max_h = compose_sheet(
                 file_paths=self._collect_file_paths(),
@@ -974,6 +1027,18 @@ class GenerateSheetTab(QMainWindow):
             )
             with open(output_json, "w", encoding="utf-8") as handle:
                 json.dump(pixi_data, handle, indent=2)
+
+            if godot is not None and godot.enabled:
+                written = export_godot_resources(
+                    godot_atlas_res,
+                    export_frames,
+                    godot.output_dir,
+                    os.path.splitext(os.path.basename(output_image))[0],
+                    godot.atlas_textures,
+                    godot.sprite_frames,
+                    godot.fps,
+                )
+                self.log_message(f"Godot resources: {len(written)} file(s) in {godot.output_dir}")
 
             self.output_image_edit.setText(output_image)
             self.output_json_edit.setText(output_json)
