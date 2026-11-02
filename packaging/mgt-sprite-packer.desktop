@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=MGT Sprite Packing Tool
+Exec=MGTSpritePacker
+Icon=mgt-sprite-packer
+Categories=Graphics;
